@@ -16,6 +16,7 @@ const {
   SUPABASE_URL,
   SUPABASE_SERVICE_KEY,
   FRONTEND_URL,
+  PAGE_ACCESS_TOKEN, // <-- Added this so the bot can reply to DMs
   PORT = 3000
 } = process.env;
 
@@ -36,11 +37,10 @@ app.get('/auth/instagram', (req, res) => {
 });
 
 app.get('/auth/instagram/callback', async (req, res) => {
-  const { code, state } = req.query; // 'state' should contain the Supabase user ID passed from frontend
+  const { code, state } = req.query; 
   const redirectUri = `${req.protocol}://${req.get('host')}/auth/instagram/callback`;
 
   try {
-    // 1. Exchange code for short-lived token
     const tokenResponse = await axios.get(`https://graph.facebook.com/v18.0/oauth/access_token`, {
       params: {
         client_id: INSTAGRAM_APP_ID,
@@ -51,7 +51,6 @@ app.get('/auth/instagram/callback', async (req, res) => {
     });
     const shortLivedToken = tokenResponse.data.access_token;
 
-    // 2. Exchange for long-lived token
     const longLivedResponse = await axios.get(`https://graph.facebook.com/v18.0/oauth/access_token`, {
       params: {
         grant_type: 'fb_exchange_token',
@@ -62,14 +61,10 @@ app.get('/auth/instagram/callback', async (req, res) => {
     });
     const longLivedToken = longLivedResponse.data.access_token;
 
-    // 3. Get User Info (Fetch connected Instagram account)
     const userResponse = await axios.get(`https://graph.facebook.com/v18.0/me?fields=id,name,accounts{instagram_business_account}&access_token=${longLivedToken}`);
     
-    // Extract IG user ID (assuming first connected page)
     const igAccountId = userResponse.data.accounts?.data[0]?.instagram_business_account?.id;
     
-    // 4. Save to Supabase
-    // Note: 'state' should be passed from the frontend containing the logged-in user's UUID
     if (igAccountId && state) {
        await supabase.from('users').update({
          instagram_user_id: igAccountId,
@@ -106,21 +101,59 @@ app.get('/webhook', (req, res) => {
 app.post('/webhook', async (req, res) => {
   const body = req.body;
 
-  if (body.object === 'instagram') {
+  // Accept both 'instagram' and 'page' objects just in case
+  if (body.object === 'instagram' || body.object === 'page') {
     res.status(200).send('EVENT_RECEIVED'); // Acknowledge immediately to Facebook
 
     for (const entry of body.entry) {
-      for (const change of entry.changes) {
-        if (change.field === 'comments') {
-          const comment = change.value;
-          await handleInstagramComment(comment);
+      
+      // --- HANDLE COMMENTS ---
+      if (entry.changes) {
+        for (const change of entry.changes) {
+          if (change.field === 'comments') {
+            const comment = change.value;
+            await handleInstagramComment(comment);
+          }
         }
       }
+
+      // --- HANDLE DIRECT MESSAGES (DMs) ---
+      if (entry.messaging) {
+        for (const webhookEvent of entry.messaging) {
+          if (webhookEvent.message && webhookEvent.message.text) {
+            const senderIgId = webhookEvent.sender.id;
+            const messageText = webhookEvent.message.text;
+            
+            await handleInstagramDM(senderIgId, messageText);
+          }
+        }
+      }
+      
     }
   } else {
     res.sendStatus(404);
   }
 });
+
+// --- NEW FUNCTION TO HANDLE DMs ---
+async function handleInstagramDM(senderId, messageText) {
+  console.log(`Received DM from ${senderId}: "${messageText}"`);
+  
+  // This is a simple auto-reply to prove the bot works!
+  const replyText = `Hello! I am your bot. I received your message: "${messageText}"`;
+
+  try {
+    await axios.post(`https://graph.facebook.com/v18.0/me/messages`, {
+      recipient: { id: senderId },
+      message: { text: replyText }
+    }, {
+      headers: { Authorization: `Bearer ${PAGE_ACCESS_TOKEN}` }
+    });
+    console.log("✅ Reply sent successfully!");
+  } catch (err) {
+    console.error('❌ Error sending DM reply:', err.response?.data || err.message);
+  }
+}
 
 async function handleInstagramComment(comment) {
   const postId = comment.media.id;
@@ -129,7 +162,6 @@ async function handleInstagramComment(comment) {
   const commenterUsername = comment.from.username;
   const commentId = comment.id;
 
-  // 1. Find active automation for this post
   const { data: automations, error } = await supabase
     .from('automations')
     .select('*, users(instagram_access_token)')
@@ -141,7 +173,6 @@ async function handleInstagramComment(comment) {
   const automation = automations[0];
   const accessToken = automation.users.instagram_access_token;
 
-  // 2. Check keywords
   const hasKeyword = automation.keywords.some(keyword => 
     commentText.includes(keyword.toLowerCase())
   );
@@ -149,7 +180,6 @@ async function handleInstagramComment(comment) {
   if (!hasKeyword) return;
 
   try {
-    // 3a. Send Public Comment Reply
     if (automation.comment_reply_text) {
       await axios.post(`https://graph.facebook.com/v18.0/${commentId}/replies`, {
         message: automation.comment_reply_text
@@ -158,7 +188,6 @@ async function handleInstagramComment(comment) {
       });
     }
 
-    // 3b. Send DM to commenter
     if (automation.dm_message) {
       await axios.post(`https://graph.facebook.com/v18.0/me/messages`, {
         recipient: { id: commenterIgId },
@@ -168,7 +197,6 @@ async function handleInstagramComment(comment) {
       });
     }
 
-    // 3c. Save Lead
     await supabase.from('leads').insert({
       automation_id: automation.id,
       user_id: automation.user_id,
@@ -179,7 +207,6 @@ async function handleInstagramComment(comment) {
       link_clicked: false
     });
 
-    // 3d. Update Metrics (Increment messages_sent)
     const today = new Date().toISOString().split('T')[0];
     
     const { data: existingMetric } = await supabase
@@ -246,7 +273,7 @@ app.get('/leads/:automation_id', async (req, res) => {
 });
 
 app.get('/metrics/:user_id', async (req, res) => {
-  const { period } = req.query; // 7days, 30days, alltime
+  const { period } = req.query; 
   let query = supabase.from('metrics').select('*').eq('user_id', req.params.user_id);
 
   if (period === '7days') {
